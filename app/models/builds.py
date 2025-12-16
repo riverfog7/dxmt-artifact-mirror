@@ -8,7 +8,7 @@ from pydantic import field_validator
 class BuiltinBuild(SQLModel, table=True):
     __tablename__ = "builtinbuild"
 
-    id: int = Field(primary_key=True)  # the github action run ID
+    github_run_id: int = Field(primary_key=True)  # the github action run ID
     commit_sha: str = Field(index=True)
     description: str
     created_at: datetime
@@ -33,7 +33,7 @@ class BuiltinArtifact(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     artifact_id: int = Field(index=True)  # corresponds to GitHub artifact ID can be non-unique
-    build_id: int = Field(foreign_key="builtinbuild.id", index=True)
+    build_id: int = Field(foreign_key="builtinbuild.github_run_id", index=True)
     name: str  # file name without any path components
 
     build: BuiltinBuild = Relationship(back_populates="artifacts")
