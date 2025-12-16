@@ -15,7 +15,10 @@ class DXMTArtifactManager:
         self.bucket_prefix = bucket_prefix
         self.bucket_url = f"s3://{bucket_name}/{bucket_prefix}"
         # access keys are picked up from environment variables
-        self.s3_client = boto3.client("s3", endpoint_url=endpoint_url) if endpoint_url else boto3.client("s3")
+        if endpoint_url:
+            self.s3_client = boto3.client("s3", endpoint_url=endpoint_url, config=boto3.session.Config(s3={'addressing_style': 'path'}))
+        else:
+            self.s3_client = boto3.client("s3")
 
 
     def _get_s3_key(self, artifact: Union[BuiltinArtifact, ReleaseArtifact]) -> str:
