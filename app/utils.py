@@ -13,3 +13,6 @@ def get_db():
 def get_bucket_name() -> str:
     return os.environ.get("S3_BUCKET_NAME", "dxmt-artifacts")
 
+def get_endpoint_url() -> str:
+    return os.environ.get("S3_ENDPOINT_URL", None)
+

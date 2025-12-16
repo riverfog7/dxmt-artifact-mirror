@@ -28,12 +28,14 @@ class GitHubAPIClient:
         self.headers["Authorization"] = f"Bearer {token}"
 
 
-    def get_action_runs(self, owner: str, repo: str, per_page: int = 30, page: int = 1):
+    def get_action_runs(self, owner: str, repo: str, per_page: int = 30, page: int = 1, status: Optional[str] = None):
         url = f"{self.BASE_URL}/repos/{owner}/{repo}/actions/runs"
         params = {
             "per_page": per_page,
             "page": page
         }
+        if status:
+            params["status"] = status
         response = requests.get(url, headers=self.headers, params=params)
         response.raise_for_status()
 
