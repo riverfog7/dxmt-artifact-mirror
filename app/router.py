@@ -5,7 +5,7 @@ from fastapi.routing import APIRouter
 from fastapi.responses import RedirectResponse
 from sqlmodel import Session
 
-from .utils import get_db, get_bucket_name
+from .utils import get_db, get_bucket_name, get_endpoint_url
 from .artifact_manager import DXMTArtifactManager
 
 router = APIRouter()
@@ -13,7 +13,7 @@ artifact_router = APIRouter(prefix="/artifacts")
 build_router = APIRouter(prefix="/builds")
 
 def get_artifact_manager(session: Session = Depends(get_db)):
-    return DXMTArtifactManager(session, bucket_name=get_bucket_name())
+    return DXMTArtifactManager(session, bucket_name=get_bucket_name(), endpoint_url=get_endpoint_url())
 
 @router.get("/health")
 async def health_check():
