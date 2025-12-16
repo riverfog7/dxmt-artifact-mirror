@@ -11,7 +11,7 @@ class BuiltinBuild(SQLModel, table=True):
     github_run_id: int = Field(primary_key=True)  # the github action run ID
     commit_sha: str = Field(index=True)
     description: str
-    created_at: datetime
+    created_at: datetime = Field(index=True)
     artifact_count: int
 
     artifacts: List["BuiltinArtifact"] = Relationship(back_populates="build")
@@ -20,7 +20,7 @@ class BuiltinBuild(SQLModel, table=True):
 class ReleaseBuild(SQLModel, table=True):
     __tablename__ = "releasebuild"
     tag: str = Field(primary_key=True, index=True)  # the release tag
-    created_at: datetime
+    created_at: datetime = Field(index=True)
     artifact_count: int
 
     artifacts: List["ReleaseArtifact"] = Relationship(back_populates="build")
