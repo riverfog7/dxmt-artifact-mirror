@@ -1,6 +1,6 @@
 services:
   dxmt-mirror:
-    build: https://github.com/riverfog7/dxmt-artifact-mirror.git
+    build: https://github.com/riverfog7/dxmt-artifact-mirror.git#main
     container_name: dxmt-mirror
     ports:
       - "8142:8000"
