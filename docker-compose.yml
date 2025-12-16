@@ -1,0 +1,16 @@
+services:
+  dxmt-mirror:
+    build: https://github.com/riverfog7/dxmt-artifact-mirror.git
+    container_name: dxmt-mirror
+    ports:
+      - "8000:8142"
+    environment:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - S3_ENDPOINT_URL
+      - GITHUB_TOKEN
+      - S3_BUCKET_NAME
+      - DATABASE_URL=sqlite:////data/dxmt_mirror.db
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
