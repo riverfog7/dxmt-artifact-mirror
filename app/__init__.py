@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import dotenv
 from fastapi import FastAPI
 from sqlmodel import SQLModel
+from starlette.middleware.cors import CORSMiddleware
 
 from .artifact_manager import DXMTArtifactManager
 from .github import GitHubAPIClient
@@ -34,6 +35,15 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins - adjust if you want to restrict
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 app.include_router(router)
 app.include_router(artifact_router)
