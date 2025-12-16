@@ -27,16 +27,20 @@ class ArtifactSyncer:
     async def sync_loop(self):
         while True:
             try:
-                logger.info("Starting sync cycle...")
-                with Session(self.engine) as session:
-                    artifact_manager = DXMTArtifactManager(session, self.bucket_name, endpoint_url=get_endpoint_url())
-                    self.sync_builtin_builds(session, artifact_manager)
-                    self.sync_releases(session, artifact_manager)
-                logger.info("Sync cycle completed.")
+                # Run the blocking sync cycle in a separate thread to avoid blocking the event loop
+                await asyncio.to_thread(self._run_sync_cycle)
             except Exception as e:
                 logger.error(f"Error in sync cycle: {e}", exc_info=True)
 
             await asyncio.sleep(60)
+
+    def _run_sync_cycle(self):
+        logger.info("Starting sync cycle...")
+        with Session(self.engine) as session:
+            artifact_manager = DXMTArtifactManager(session, self.bucket_name, endpoint_url=get_endpoint_url())
+            self.sync_builtin_builds(session, artifact_manager)
+            self.sync_releases(session, artifact_manager)
+        logger.info("Sync cycle completed.")
 
     def sync_builtin_builds(self, session: Session, artifact_manager: DXMTArtifactManager):
         logger.info("Syncing builtin builds...")
@@ -62,7 +66,6 @@ class ArtifactSyncer:
                 if run.id <= latest_run_id:
                     should_continue = False
                     break
-
 
                 # if the run date is older than 4 months, stop processing further
                 if run.created_at < datetime.now(timezone.utc) - timedelta(days=100):
