@@ -13,6 +13,7 @@ class BuiltinBuild(SQLModel, table=True):
     description: str
     created_at: datetime = Field(index=True)
     artifact_count: int
+    has_wow64: bool = Field(default=False)
 
     artifacts: List["BuiltinArtifact"] = Relationship(back_populates="build")
 
@@ -22,6 +23,7 @@ class ReleaseBuild(SQLModel, table=True):
     tag: str = Field(primary_key=True, index=True)  # the release tag
     created_at: datetime = Field(index=True)
     artifact_count: int
+    has_wow64: bool = Field(default=False)
 
     artifacts: List["ReleaseArtifact"] = Relationship(back_populates="build")
 
@@ -35,6 +37,7 @@ class BuiltinArtifact(SQLModel, table=True):
     artifact_id: int = Field(index=True)  # corresponds to GitHub artifact ID can be non-unique
     build_id: int = Field(foreign_key="builtinbuild.github_run_id", index=True)
     name: str  # file name without any path components
+    is_wow64: bool = Field(default=False)
 
     build: BuiltinBuild = Relationship(back_populates="artifacts")
 
@@ -52,6 +55,7 @@ class ReleaseArtifact(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     build_tag: str = Field(foreign_key="releasebuild.tag", index=True)
     name: str  # file name without any path components
+    is_wow64: bool = Field(default=False)
 
     build: ReleaseBuild = Relationship(back_populates="artifacts")
 
