@@ -3,7 +3,7 @@ services:
     build: https://github.com/riverfog7/dxmt-artifact-mirror.git
     container_name: dxmt-mirror
     ports:
-      - "8000:8142"
+      - "8142:8000"
     environment:
       - AWS_ACCESS_KEY_ID
       - AWS_SECRET_ACCESS_KEY
