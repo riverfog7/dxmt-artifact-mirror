@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "boto3>=1.42.10",
     "fastapi[standard]>=0.124.4",
     "notebook>=7.5.0",
     "pydantic>=2.12.5",
