@@ -38,6 +38,7 @@ class ArtifactSyncer:
         logger.info("Starting sync cycle...")
         with Session(self.engine) as session:
             artifact_manager = DXMTArtifactManager(session, self.bucket_name, endpoint_url=get_endpoint_url())
+            self.sync_builtin_builds(session, artifact_manager)
             self.sync_releases(session, artifact_manager)
         logger.info("Sync cycle completed.")
 
