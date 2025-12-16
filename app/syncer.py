@@ -38,7 +38,6 @@ class ArtifactSyncer:
         logger.info("Starting sync cycle...")
         with Session(self.engine) as session:
             artifact_manager = DXMTArtifactManager(session, self.bucket_name, endpoint_url=get_endpoint_url())
-            self.sync_builtin_builds(session, artifact_manager)
             self.sync_releases(session, artifact_manager)
         logger.info("Sync cycle completed.")
 
@@ -248,18 +247,28 @@ class ArtifactSyncer:
                 return
 
             # Check folders and upload
-            i386_windows = extract_dir / "i386-windows"
-            x86_64_windows = extract_dir / "x86_64-windows"
-            x86_64_unix = extract_dir / "x86_64-unix"
+            # use glob to find the expected folders
+            def find_folder(name):
+                matches = [p for p in extract_dir.rglob(name) if p.is_dir()]
+                if len(matches) > 1:
+                    raise ValueError(f"Found multiple folders named {name} in release artifact")
+                return matches[0] if matches else None
 
-            if i386_windows.exists():
+            i386_windows = find_folder("i386-windows")
+            x86_64_windows = find_folder("x86_64-windows")
+            x86_64_unix = find_folder("x86_64-unix")
+
+            if i386_windows:
+                logger.info(f"Found i386-windows folder in release {release.tag_name}, marking as wow64")
                 has_wow64 = True
                 self._upload_release_files(release, i386_windows, True, processed_artifacts, artifact_manager)
 
-            if x86_64_windows.exists():
+            if x86_64_windows:
+                logger.info(f"Found x86_64-windows folder in release {release.tag_name}")
                 self._upload_release_files(release, x86_64_windows, False, processed_artifacts, artifact_manager)
 
-            if x86_64_unix.exists():
+            if x86_64_unix:
+                logger.info(f"Found x86_64-unix folder in release {release.tag_name}")
                 self._upload_release_files(release, x86_64_unix, False, processed_artifacts, artifact_manager)
 
         self._save_release_build(release, processed_artifacts, has_wow64, session)
