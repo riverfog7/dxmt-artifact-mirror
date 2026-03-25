@@ -5,6 +5,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 from sqlmodel import Session, select, col
 
@@ -99,25 +100,18 @@ class ArtifactSyncer:
             logger.info(f"Run {run.id} has no artifacts. Skipping.")
             return
 
+        selected_artifacts = self._select_builtin_source_artifacts(run, artifacts_response.artifacts)
+        if not selected_artifacts:
+            logger.info(f"Run {run.id} has no compatible builtin artifacts. Skipping.")
+            return
+
         has_wow64 = False
         processed_artifacts = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
 
-            for artifact in artifacts_response.artifacts:
-                if artifact.expired:
-                    continue
-
-                # Filter artifacts: skip gcc builds
-                if "-gcc" in artifact.name.lower():
-                    continue
-
-                if "release" not in artifact.name.lower():
-                    continue
-
-                is_wow64_artifact = "wow64" in artifact.name.lower()
-
+            for artifact in selected_artifacts:
                 # Download artifact zip
                 logger.info(f"Downloading artifact {artifact.name} from run {run.id}")
                 zip_path = temp_path / f"{artifact.name}.zip"
@@ -128,43 +122,31 @@ class ArtifactSyncer:
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(extract_dir)
 
-                # Find and extract tar.gz inside
-                tar_files = list(extract_dir.glob("*.tar.gz"))
-                if not tar_files:
-                    logger.warning(f"No tar.gz found in artifact {artifact.name}")
-                    continue
+                combined_name = f"dxmt-{run.head_sha}"
+                if artifact.name == combined_name:
+                    collected_files = self._extract_combined_ci_artifact(extract_dir)
+                elif artifact.name == "artifacts-release-gcc":
+                    collected_files = self._extract_legacy_split_ci_artifact(extract_dir, is_wow64=False)
+                elif artifact.name == "artifacts-release-wow64-gcc":
+                    collected_files = self._extract_legacy_split_ci_artifact(extract_dir, is_wow64=True)
+                else:
+                    collected_files = self._extract_split_ci_artifact(extract_dir)
 
-                tar_path = tar_files[0]
-                tar_extract_dir = extract_dir / "extracted"
-                with tarfile.open(tar_path, "r:gz") as tar_ref:
-                    tar_ref.extractall(tar_extract_dir)
-
-                # Inspect extracted files
-                for file_path in tar_extract_dir.rglob("*"):
-                    if not file_path.is_file():
-                        continue
-
-                    # Filter files based on artifact type
-                    if is_wow64_artifact:
-                        if file_path.suffix != ".dll":
-                            continue
-                        has_wow64 = True
-                    else:
-                        if file_path.suffix not in [".dll", ".so"]:
-                            continue
-
+                for file_path, is_wow64 in collected_files:
                     # Create DB object
                     db_artifact = BuiltinArtifact(
                         artifact_id=artifact.id,
                         build_id=run.id,
                         name=file_path.name,
-                        is_wow64=is_wow64_artifact
+                        is_wow64=is_wow64
                     )
 
                     # Upload to S3
                     key = artifact_manager._get_s3_key(db_artifact)
                     artifact_manager.s3_client.upload_file(str(file_path), artifact_manager.bucket_name, key)
                     processed_artifacts.append(db_artifact)
+                    if is_wow64:
+                        has_wow64 = True
 
         if not processed_artifacts:
             logger.info(f"Run {run.id} has no relevant artifacts. Skipping.")
@@ -185,6 +167,120 @@ class ArtifactSyncer:
             session.add(art)
         session.commit()
         logger.info(f"Saved run {run.id} with {len(processed_artifacts)} artifacts")
+
+    def _select_builtin_source_artifacts(self, run: GitHubActionRun, artifacts: list):
+        active_artifacts = [artifact for artifact in artifacts if not artifact.expired]
+        artifacts_by_name = {artifact.name: artifact for artifact in active_artifacts}
+
+        combined_name = f"dxmt-{run.head_sha}"
+        if combined_name in artifacts_by_name:
+            return [artifacts_by_name[combined_name]]
+
+        legacy_selected = []
+        for name in ("artifacts-release-gcc", "artifacts-release-wow64-gcc"):
+            artifact = artifacts_by_name.get(name)
+            if artifact:
+                legacy_selected.append(artifact)
+        if legacy_selected:
+            return legacy_selected
+
+        selected = []
+        for name in ("gcc-release-x86_64-windows-cross", "gcc-release-x86-windows-cross"):
+            artifact = artifacts_by_name.get(name)
+            if artifact:
+                selected.append(artifact)
+        return selected
+
+    def _extract_combined_ci_artifact(self, extract_dir: Path) -> list[tuple[Path, bool]]:
+        tar_files = sorted(extract_dir.glob("*.tar.gz"))
+        if not tar_files:
+            logger.warning(f"No combined tarball found in artifact directory {extract_dir}")
+            return []
+
+        tar_path = tar_files[0]
+        tar_extract_dir = extract_dir / "tar_extracted"
+        with tarfile.open(tar_path, "r:gz") as tar_ref:
+            tar_ref.extractall(tar_extract_dir)
+
+        runtime_root = self._find_single_top_level_dir(tar_extract_dir)
+        if runtime_root is None:
+            logger.warning(f"Combined artifact tarball {tar_path.name} did not extract to a single top-level directory")
+            return []
+
+        return self._collect_runtime_files(runtime_root)
+
+    def _extract_split_ci_artifact(self, extract_dir: Path) -> list[tuple[Path, bool]]:
+        return self._collect_runtime_files(extract_dir)
+
+    def _extract_legacy_split_ci_artifact(self, extract_dir: Path, is_wow64: bool) -> list[tuple[Path, bool]]:
+        tar_files = sorted(extract_dir.glob("*.tar.gz"))
+        if not tar_files:
+            logger.warning(f"No legacy tarball found in artifact directory {extract_dir}")
+            return []
+
+        tar_path = tar_files[0]
+        tar_extract_dir = extract_dir / "tar_extracted"
+        with tarfile.open(tar_path, "r:gz") as tar_ref:
+            tar_ref.extractall(tar_extract_dir)
+
+        runtime_root = self._find_legacy_runtime_root(tar_extract_dir)
+        if runtime_root is None:
+            logger.warning(f"Legacy artifact tarball {tar_path.name} did not extract to a build-release*/src directory")
+            return []
+
+        return self._collect_legacy_runtime_files(runtime_root, is_wow64=is_wow64)
+
+    def _find_single_top_level_dir(self, root: Path) -> Optional[Path]:
+        directories = [path for path in root.iterdir() if path.is_dir()]
+        if len(directories) == 1:
+            return directories[0]
+        return None
+
+    def _find_legacy_runtime_root(self, root: Path) -> Optional[Path]:
+        top_level_dir = self._find_single_top_level_dir(root)
+        if top_level_dir is None:
+            return None
+
+        runtime_root = top_level_dir / "src"
+        if runtime_root.is_dir():
+            return runtime_root
+        return None
+
+    def _collect_runtime_files(self, runtime_root: Path) -> list[tuple[Path, bool]]:
+        collected = []
+
+        i386_dir = runtime_root / "i386-windows"
+        if i386_dir.is_dir():
+            for file_path in i386_dir.rglob("*"):
+                if file_path.is_file() and file_path.suffix == ".dll":
+                    collected.append((file_path, True))
+
+        x64_windows_dir = runtime_root / "x86_64-windows"
+        if x64_windows_dir.is_dir():
+            for file_path in x64_windows_dir.rglob("*"):
+                if file_path.is_file() and file_path.suffix == ".dll":
+                    collected.append((file_path, False))
+
+        x64_unix_dir = runtime_root / "x86_64-unix"
+        if x64_unix_dir.is_dir():
+            for file_path in x64_unix_dir.rglob("*"):
+                if file_path.is_file() and file_path.suffix == ".so":
+                    collected.append((file_path, False))
+
+        return collected
+
+    def _collect_legacy_runtime_files(self, runtime_root: Path, is_wow64: bool) -> list[tuple[Path, bool]]:
+        collected = []
+
+        for file_path in runtime_root.rglob("*"):
+            if not file_path.is_file():
+                continue
+            if file_path.suffix == ".dll":
+                collected.append((file_path, is_wow64))
+            elif not is_wow64 and file_path.suffix == ".so":
+                collected.append((file_path, False))
+
+        return collected
 
     def sync_releases(self, session: Session, artifact_manager: DXMTArtifactManager):
         logger.info("Syncing releases...")
@@ -226,7 +322,12 @@ class ArtifactSyncer:
             self._save_release_build(release, [], False, session)
             return
 
-        asset = release.assets[0]
+        asset = self._select_release_asset(release)
+        if asset is None:
+            logger.info(f"Skipping release {release.tag_name} (no compatible tar.gz asset)")
+            self._save_release_build(release, [], False, session)
+            return
+
         has_wow64 = False
         processed_artifacts = []
 
@@ -247,47 +348,40 @@ class ArtifactSyncer:
                 self._save_release_build(release, [], False, session)
                 return
 
-            # Check folders and upload
-            # use glob to find the expected folders
-            def find_folder(name):
-                matches = [p for p in extract_dir.rglob(name) if p.is_dir()]
-                if len(matches) > 1:
-                    raise ValueError(f"Found multiple folders named {name} in release artifact")
-                return matches[0] if matches else None
+            runtime_root = self._find_single_top_level_dir(extract_dir)
+            if runtime_root is None:
+                logger.warning(f"Release asset {asset.name} did not extract to a single top-level directory")
+                self._save_release_build(release, [], False, session)
+                return
 
-            i386_windows = find_folder("i386-windows")
-            x86_64_windows = find_folder("x86_64-windows")
-            x86_64_unix = find_folder("x86_64-unix")
+            collected_files = self._collect_runtime_files(runtime_root)
+            has_wow64 = any(is_wow64 for _, is_wow64 in collected_files)
 
-            if i386_windows:
-                logger.info(f"Found i386-windows folder in release {release.tag_name}, marking as wow64")
-                has_wow64 = True
-                self._upload_release_files(release, i386_windows, True, processed_artifacts, artifact_manager)
-
-            if x86_64_windows:
-                logger.info(f"Found x86_64-windows folder in release {release.tag_name}")
-                self._upload_release_files(release, x86_64_windows, False, processed_artifacts, artifact_manager)
-
-            if x86_64_unix:
-                logger.info(f"Found x86_64-unix folder in release {release.tag_name}")
-                self._upload_release_files(release, x86_64_unix, False, processed_artifacts, artifact_manager)
+            for file_path, is_wow64 in collected_files:
+                db_artifact = ReleaseArtifact(
+                    build_tag=release.tag_name,
+                    name=file_path.name,
+                    is_wow64=is_wow64
+                )
+                key = artifact_manager._get_s3_key(db_artifact)
+                artifact_manager.s3_client.upload_file(str(file_path), artifact_manager.bucket_name, key)
+                processed_artifacts.append(db_artifact)
 
         self._save_release_build(release, processed_artifacts, has_wow64, session)
 
-    def _upload_release_files(self, release: GitHubRelease, directory: Path, is_wow64: bool, processed_list: list, artifact_manager: DXMTArtifactManager):
-        for file_path in directory.rglob("*"):
-            if not file_path.is_file():
-                continue
+    def _select_release_asset(self, release: GitHubRelease):
+        tar_assets = [asset for asset in release.assets if asset.name.endswith(".tar.gz")]
 
-            db_artifact = ReleaseArtifact(
-                build_tag=release.tag_name,
-                name=file_path.name,
-                is_wow64=is_wow64
-            )
+        for asset in tar_assets:
+            if "builtin" in asset.name:
+                return asset
 
-            key = artifact_manager._get_s3_key(db_artifact)
-            artifact_manager.s3_client.upload_file(str(file_path), artifact_manager.bucket_name, key)
-            processed_list.append(db_artifact)
+        combined_name = f"dxmt-{release.tag_name}.tar.gz"
+        for asset in tar_assets:
+            if asset.name == combined_name:
+                return asset
+
+        return None
 
     def _save_release_build(self, release: GitHubRelease, artifacts: list, has_wow64: bool, session: Session):
         build = ReleaseBuild(
