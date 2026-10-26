@@ -1,10 +1,20 @@
 import os
 
-from sqlmodel import create_engine, Session
+from sqlalchemy import inspect, text
+from sqlmodel import create_engine, Session, SQLModel
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./dxmt_mirror.db")
 
 engine = create_engine(DATABASE_URL, echo=True)
+
+def init_db(db_engine=engine):
+    with db_engine.begin() as connection:
+        SQLModel.metadata.create_all(connection)
+        columns = {column["name"] for column in inspect(connection).get_columns("builtinartifact")}
+        if "is_arm64ec" not in columns:
+            connection.execute(text(
+                "ALTER TABLE builtinartifact ADD COLUMN is_arm64ec BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
 
 def get_db():
     with Session(engine) as session:

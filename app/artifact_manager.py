@@ -24,6 +24,8 @@ class DXMTArtifactManager:
     def _get_s3_key(self, artifact: Union[BuiltinArtifact, ReleaseArtifact]) -> str:
         prefix = "wow64/" if artifact.is_wow64 else ""
         if isinstance(artifact, BuiltinArtifact):
+            if artifact.is_arm64ec:
+                prefix = f"arm64ec/{prefix}"
             return f"{self.bucket_prefix}{prefix}builtin/{artifact.build_id}/{artifact.name}"
         elif isinstance(artifact, ReleaseArtifact):
             return f"{self.bucket_prefix}{prefix}release/{artifact.build_tag}/{artifact.name}"
@@ -97,8 +99,11 @@ class DXMTArtifactManager:
         id: Optional[int] = None,
         commit_sha: Optional[str] = None,
         wow64: bool = False,
+        arm64ec: bool = False,
     ) -> List[Union[BuiltinArtifact, ReleaseArtifact]]:
         if tag:
+            if arm64ec:
+                return []
             # List artifacts for a release build by tag
             return list(self.db_session.exec(
                 select(ReleaseArtifact).where(ReleaseArtifact.build_tag == tag, ReleaseArtifact.is_wow64 == wow64)
@@ -106,7 +111,11 @@ class DXMTArtifactManager:
         elif id:
             # List artifacts for a builtin build by github_run_id
             return list(self.db_session.exec(
-                select(BuiltinArtifact).where(BuiltinArtifact.build_id == id, BuiltinArtifact.is_wow64 == wow64)
+                select(BuiltinArtifact).where(
+                    BuiltinArtifact.build_id == id,
+                    BuiltinArtifact.is_wow64 == wow64,
+                    BuiltinArtifact.is_arm64ec == arm64ec,
+                )
             ).all())
         elif commit_sha:
             # List artifacts for a builtin build by commit_sha
@@ -116,7 +125,11 @@ class DXMTArtifactManager:
             ).first()
             if build:
                 return list(self.db_session.exec(
-                    select(BuiltinArtifact).where(BuiltinArtifact.build_id == build.github_run_id, BuiltinArtifact.is_wow64 == wow64)
+                    select(BuiltinArtifact).where(
+                        BuiltinArtifact.build_id == build.github_run_id,
+                        BuiltinArtifact.is_wow64 == wow64,
+                        BuiltinArtifact.is_arm64ec == arm64ec,
+                    )
                 ).all())
             return []
         return []

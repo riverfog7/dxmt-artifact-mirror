@@ -4,14 +4,13 @@ from contextlib import asynccontextmanager
 
 import dotenv
 from fastapi import FastAPI
-from sqlmodel import SQLModel
 from starlette.middleware.cors import CORSMiddleware
 
 from .artifact_manager import DXMTArtifactManager
 from .github import GitHubAPIClient
 from .router import router, artifact_router, build_router
 from .syncer import ArtifactSyncer
-from .utils import engine, get_bucket_name, get_endpoint_url
+from .utils import engine, get_bucket_name, get_endpoint_url, init_db
 
 dotenv.load_dotenv(dotenv.find_dotenv())
 
@@ -20,8 +19,8 @@ logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables
-    SQLModel.metadata.create_all(engine)
+    # Create tables and migrate existing databases before starting the syncer.
+    init_db()
 
     # Start syncer in background
     github_client = GitHubAPIClient()

@@ -7,6 +7,7 @@ This service mirrors artifacts from the [DXMT](https://github.com/3Shain/dxmt) p
 - **Automatic Sync**: Periodically checks for new GitHub Actions runs and Releases.
 - **Artifact Mirroring**: Downloads and stores artifacts in an S3-compatible storage.
 - **Wow64 Support**: Distinguishes between 64-bit and 32-bit (Wow64) artifacts.
+- **ARM64EC Selection**: CI artifact metadata and download queries distinguish ARM64EC from x64 and Wow64 files.
 - **Fast Downloads**: Serves artifacts via presigned S3 URLs for optimal performance.
 - **API Access**: Provides a REST API to list builds, artifacts, and generate download links.
 
@@ -47,7 +48,19 @@ List specific artifacts for a given build. You must provide exactly one of `tag`
   - `id` (int, optional): The GitHub Run ID. Use this for CI builds.
   - `commit_sha` (string, optional): The commit SHA. Use this for CI builds.
   - `wow64` (boolean, optional): Set to `true` to list 32-bit artifacts. Defaults to `false` (64-bit).
+  - `arm64ec` (boolean, optional): Set to `true` to list ARM64EC CI artifacts. Defaults to `false`. With `tag`, `true` returns an empty list.
 - **Response**: A JSON object containing a list of artifact details.
+
+CI queries filter both flags independently:
+
+| `wow64` | `arm64ec` | Files |
+|---|---|---|
+| `false` | `false` | x64 |
+| `true` | `false` | i386 (Wow64) |
+| `false` | `true` | ARM64EC DLLs and the arm64 Unix library |
+| `true` | `true` | No matching files in current CI artifacts |
+
+ARM64EC CI files use the S3 prefix `dxmt-artifacts/arm64ec/builtin/`. Existing x64 and Wow64 paths remain unchanged.
 
 #### Download Build Artifact (CI)
 
@@ -59,6 +72,7 @@ Download a specific artifact from a CI build. This endpoint redirects to a tempo
   - `artifact_name` (string): The name of the file to download (e.g., `d3d11.dll`).
 - **Query Parameters**:
   - `wow64` (boolean, optional): Set to `true` if downloading a 32-bit artifact. Defaults to `false`.
+  - `arm64ec` (boolean, optional): Set to `true` for an ARM64EC CI artifact. Defaults to `false`.
 
 #### Download Release Artifact
 
@@ -95,4 +109,10 @@ You can deploy the service using Docker Compose.
     ```
 
 The service will be available at `http://localhost:8000`. Data will be persisted in the `./data` directory.
+
+At startup, existing databases are automatically migrated before syncing. The migration adds `is_arm64ec` to CI artifact records, defaulting existing rows to `false`, and is safe to repeat.
+
+## Tests
+
+Run the focused database and API checks with `uv run python -m unittest discover -s tests -v`.
 

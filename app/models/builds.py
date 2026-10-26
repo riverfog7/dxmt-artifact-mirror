@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import List, Optional
 
+from sqlalchemy import false
 from sqlmodel import Field, Relationship, SQLModel
 from pydantic import field_validator
 
@@ -38,6 +39,7 @@ class BuiltinArtifact(SQLModel, table=True):
     build_id: int = Field(foreign_key="builtinbuild.github_run_id", index=True)
     name: str  # file name without any path components
     is_wow64: bool = Field(default=False)
+    is_arm64ec: bool = Field(default=False, sa_column_kwargs={"server_default": false()})
 
     build: BuiltinBuild = Relationship(back_populates="artifacts")
 

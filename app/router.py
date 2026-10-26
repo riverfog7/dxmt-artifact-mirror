@@ -26,6 +26,7 @@ async def list_artifacts(
     id: Optional[int] = None,
     commit_sha: Optional[str] = None,
     wow64: bool = False,
+    arm64ec: bool = False,
     manager: DXMTArtifactManager = Depends(get_artifact_manager)
 ):
     if not tag and not id and not commit_sha:
@@ -35,7 +36,7 @@ async def list_artifacts(
     if id and commit_sha:
         return {"error": "id cannot be combined with commit_sha"}
 
-    artifacts = manager.list_artifacts(tag=tag, id=id, commit_sha=commit_sha, wow64=wow64)
+    artifacts = manager.list_artifacts(tag=tag, id=id, commit_sha=commit_sha, wow64=wow64, arm64ec=arm64ec)
     return {"artifacts": artifacts}
 
 
@@ -54,10 +55,11 @@ async def download_build_artifact(
     github_run_id: int,
     artifact_name: str,
     wow64: bool = False,
+    arm64ec: bool = False,
     manager: DXMTArtifactManager = Depends(get_artifact_manager)
 ):
     # Find the artifact
-    artifacts = manager.list_artifacts(id=github_run_id, wow64=wow64)
+    artifacts = manager.list_artifacts(id=github_run_id, wow64=wow64, arm64ec=arm64ec)
     target_artifact = next((a for a in artifacts if a.name == artifact_name), None)
 
     if not target_artifact:
