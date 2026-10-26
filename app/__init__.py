@@ -6,9 +6,9 @@ import dotenv
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
-from .artifact_manager import DXMTArtifactManager
+from .errors import install_error_handlers
 from .github import GitHubAPIClient
-from .router import router, artifact_router, build_router
+from .router import router, build_router
 from .syncer import ArtifactSyncer
 from .utils import engine, get_bucket_name, get_endpoint_url, init_db
 
@@ -33,7 +33,8 @@ async def lifespan(app: FastAPI):
     # Cleanup
     task.cancel()
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(title="DXMT Artifact Mirror", description="Discover mirrored CI builds, releases, and runtime files.", lifespan=lifespan)
+install_error_handlers(app)
 
 # Add CORS middleware
 app.add_middleware(
@@ -45,5 +46,4 @@ app.add_middleware(
 )
 
 app.include_router(router)
-app.include_router(artifact_router)
 app.include_router(build_router)

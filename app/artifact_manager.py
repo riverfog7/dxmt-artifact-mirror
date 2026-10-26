@@ -1,11 +1,12 @@
 from sqlmodel import Session, select, col
 from typing import List, Union, Optional
-from sqlalchemy import literal, cast, String, union_all, text
+from sqlalchemy import and_, false, func, literal, cast, String, union_all
 from sqlalchemy.orm import selectinload
 import boto3
 
 
 from .models.builds import BuiltinBuild, ReleaseBuild, BuiltinArtifact, ReleaseArtifact
+from .models.api import Architecture, BuildFilters, BuildListQuery, BuildSource
 
 
 class DXMTArtifactManager:
@@ -44,92 +45,77 @@ class DXMTArtifactManager:
         )
 
 
-    def list_builds(self, page: int = 1, page_size: int = 10) -> List[Union[BuiltinBuild, ReleaseBuild]]:
-        offset = (page - 1) * page_size
+    @staticmethod
+    def _architecture_filter(model, arch: Architecture):
+        conditions = [model.is_wow64 == (arch == Architecture.X86)]
+        if model is BuiltinArtifact:
+            conditions.append(model.is_arm64ec == (arch == Architecture.ARM64EC))
+        elif arch == Architecture.ARM64EC:
+            conditions.append(false())
+        return and_(*conditions)
 
-        q_builtin = select(
-            literal("builtin").label("type"),
-            cast(col(BuiltinBuild.github_run_id), String).label("id"),
-            col(BuiltinBuild.created_at),
-        )
-
-        q_release = select(
-            literal("release").label("type"),
-            col(ReleaseBuild.tag).label("id"),
-            col(ReleaseBuild.created_at),
-        )
-
-        combined_query = (
-            union_all(q_builtin, q_release)
-            .order_by(text("created_at DESC"))
-            .limit(page_size)
-            .offset(offset)
-        )
-
-        results = self.db_session.exec(combined_query).all()
-
-        builtin_ids = [int(row.id) for row in results if row.type == "builtin"]
-        release_ids = [row.id for row in results if row.type == "release"]
-
-        builds = []
-        if builtin_ids:
-            builds.extend(
-                self.db_session.exec(
-                    select(BuiltinBuild)
-                    .where(col(BuiltinBuild.github_run_id).in_(builtin_ids))
-                    .options(selectinload(BuiltinBuild.artifacts))
-                ).all()
+    def _build_query(self, filters: BuildFilters, source: BuildSource | None):
+        queries = []
+        for kind, model, artifact_model, key, foreign_key in (
+            (BuildSource.CI, BuiltinBuild, BuiltinArtifact, BuiltinBuild.github_run_id, BuiltinArtifact.build_id),
+            (BuildSource.RELEASE, ReleaseBuild, ReleaseArtifact, ReleaseBuild.tag, ReleaseArtifact.build_tag),
+        ):
+            if (source is not None and source != kind) or (filters.commit and kind != BuildSource.CI):
+                continue
+            query = select(
+                literal(kind.value).label("source"), cast(col(key), String).label("ref"),
+                model.created_at, (col(key) if kind == BuildSource.CI else literal(0)).label("sort_id"),
             )
-        if release_ids:
-            builds.extend(
-                self.db_session.exec(
-                    select(ReleaseBuild)
-                    .where(col(ReleaseBuild.tag).in_(release_ids))
-                    .options(selectinload(ReleaseBuild.artifacts))
-                ).all()
-            )
-
-        builds.sort(key=lambda b: b.created_at, reverse=True)
-
-        return builds
-
-    def list_artifacts(
-        self,
-        tag: Optional[str] = None,
-        id: Optional[int] = None,
-        commit_sha: Optional[str] = None,
-        wow64: bool = False,
-        arm64ec: bool = False,
-    ) -> List[Union[BuiltinArtifact, ReleaseArtifact]]:
-        if tag:
-            if arm64ec:
-                return []
-            # List artifacts for a release build by tag
-            return list(self.db_session.exec(
-                select(ReleaseArtifact).where(ReleaseArtifact.build_tag == tag, ReleaseArtifact.is_wow64 == wow64)
-            ).all())
-        elif id:
-            # List artifacts for a builtin build by github_run_id
-            return list(self.db_session.exec(
-                select(BuiltinArtifact).where(
-                    BuiltinArtifact.build_id == id,
-                    BuiltinArtifact.is_wow64 == wow64,
-                    BuiltinArtifact.is_arm64ec == arm64ec,
+            if filters.commit:
+                query = query.where(BuiltinBuild.commit_sha == filters.commit)
+            if filters.arch is not None:
+                files = select(artifact_model.id).where(
+                    foreign_key == key, self._architecture_filter(artifact_model, filters.arch),
                 )
-            ).all())
-        elif commit_sha:
-            # List artifacts for a builtin build by commit_sha
-            # First find the build_id from the commit_sha
-            build = self.db_session.exec(
-                select(BuiltinBuild).where(BuiltinBuild.commit_sha == commit_sha)
-            ).first()
-            if build:
-                return list(self.db_session.exec(
-                    select(BuiltinArtifact).where(
-                        BuiltinArtifact.build_id == build.github_run_id,
-                        BuiltinArtifact.is_wow64 == wow64,
-                        BuiltinArtifact.is_arm64ec == arm64ec,
-                    )
-                ).all())
-            return []
-        return []
+                query = query.where(files.exists())
+            queries.append(query)
+        return union_all(*queries).subquery()
+
+    @staticmethod
+    def _ordered_builds(query):
+        return select(query.c.source, query.c.ref, query.c.created_at, query.c.sort_id).order_by(
+            query.c.created_at.desc(), query.c.source, query.c.sort_id.desc(), query.c.ref.desc(),
+        )
+
+    def _load_builds(self, rows) -> List[Union[BuiltinBuild, ReleaseBuild]]:
+        builds = {}
+        for kind, model, key in (
+            (BuildSource.CI, BuiltinBuild, BuiltinBuild.github_run_id),
+            (BuildSource.RELEASE, ReleaseBuild, ReleaseBuild.tag),
+        ):
+            refs = [int(row.ref) if kind == BuildSource.CI else row.ref for row in rows if row.source == kind]
+            if not refs:
+                continue
+            for build in self.db_session.exec(
+                select(model).where(col(key).in_(refs)).options(selectinload(model.artifacts))
+            ).all():
+                ref = str(build.github_run_id) if kind == BuildSource.CI else build.tag
+                builds[(kind, ref)] = build
+        return [builds[(row.source, row.ref)] for row in rows]
+
+    def list_builds(self, filters: BuildListQuery) -> tuple[List[Union[BuiltinBuild, ReleaseBuild]], int]:
+        query = self._build_query(filters, filters.source)
+        total = self.db_session.exec(select(func.count()).select_from(query)).one()
+        rows = self.db_session.exec(
+            self._ordered_builds(query).limit(filters.per_page).offset((filters.page-1)*filters.per_page)
+        ).all()
+        return self._load_builds(rows), total
+
+    def get_build(self, source: BuildSource, ref: str) -> BuiltinBuild | ReleaseBuild | None:
+        if source == BuildSource.CI:
+            if len(ref) > 19 or not ref.isascii() or not ref.isdecimal() or not 0 < int(ref) < 2**63:
+                return None
+            model, condition = BuiltinBuild, BuiltinBuild.github_run_id == int(ref)
+        else:
+            model, condition = ReleaseBuild, ReleaseBuild.tag == ref
+        return self.db_session.exec(
+            select(model).where(condition).options(selectinload(model.artifacts))
+        ).first()
+
+    def get_file(self, build: BuiltinBuild | ReleaseBuild, arch: Architecture, name: str) -> BuiltinArtifact | ReleaseArtifact | None:
+        return next((a for a in build.artifacts if a.name == name and Architecture.of(a) == arch), None)

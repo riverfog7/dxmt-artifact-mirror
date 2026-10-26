@@ -29,75 +29,50 @@ Source artifact IDs are saved after all uploads for a build succeed. Repeated ba
 
 ### Base URL
 
-The API is served at the root of the deployed service. For example: `http://localhost:8000`.
+The API is served at the deployed service root, for example `http://localhost:8000`. Interactive documentation is at `/docs`; the complete Pydantic request and response schemas are at `/openapi.json`.
 
-### Health Check
+The public API uses `source=ci|release` and `arch=x86|x86_64|arm64ec`. `x86` selects i386 DLLs for Wow64. `x86_64` and `arm64ec` each include their Windows DLLs and corresponding Unix library. Omitting `arch` includes all available architectures.
 
-Check if the service is running.
+### Discover and Inspect Builds
 
-- **Endpoint**: `GET /health`
-- **Response**: `{"status": "ok"}`
+| Request | Result |
+|---|---|
+| `GET /builds` | CI builds and releases, newest first |
+| `GET /builds?source=ci&arch=arm64ec` | CI builds with mirrored ARM64EC files |
+| `GET /builds?commit=<full-sha>` | Every CI run for that commit, newest first |
+| `GET /builds/ci/{run_id}` | CI metadata and files |
+| `GET /builds/release/{tag}` | Release metadata and files |
+| `GET /builds/ci/{run_id}?arch=x86_64` | Build metadata with only x64 files in `files` |
+| `GET /health` | `{"status":"ok"}` |
 
-### Builds
+`GET /builds` accepts `source`, `arch`, `commit`, `page` (default 1, minimum 1), and `per_page` (default 20, range 1–100). `commit` is a full 40-character SHA and applies only to CI builds. Unknown query parameters are rejected. Ordering uses creation time descending, source, CI run ID descending, then reference descending so ties are deterministic.
 
-#### List Builds
+List responses contain `items`, `page`, `per_page`, `total`, and `has_more`. Both CI and release summaries use the same fields: `source`, `ref`, `created_at` (UTC), `commit_sha`, `description`, `architectures`, and `file_count`. `ref` is the run ID as a string or the release tag. Release `commit_sha` and `description` are `null`. Counts and available architectures come from mirrored file records, including files retained after their upstream artifacts expire.
 
-Retrieve a paginated list of all builds (both CI builds and Releases), sorted by creation date (newest first).
+Build details add a `files` array with `name` and `arch`. An `arch` filter narrows this array; metadata still describes the entire build. Existing builds with no files for that architecture return an empty array.
 
-- **Endpoint**: `GET /builds/list`
-- **Parameters**:
-  - `page` (int, optional): Page number (default: 1).
-  - `page_size` (int, optional): Number of items per page (default: 10).
-- **Response**: A JSON object containing a list of builds. Each build object includes details like `id` (run ID or tag), `type` ("builtin" or "release"), `created_at`, `artifact_count`, and `has_wow64`.
+### Download Files
 
-### Artifacts
+| Request | Result |
+|---|---|
+| `GET /builds/ci/{run_id}/files/{arch}/{name}` | Download a CI file |
+| `GET /builds/release/{tag}/files/{arch}/{name}` | Download a release file |
 
-#### List Artifacts
+Downloads return HTTP 307 with a temporary signed S3 URL in `Location`. Redirects are marked `Cache-Control: no-store`. For example:
 
-List specific artifacts for a given build. You must provide exactly one of `tag`, `id`, or `commit_sha`.
+```sh
+curl -fL -o d3d12.dll http://localhost:8000/builds/ci/39904585849/files/x86_64/d3d12.dll
+```
 
-- **Endpoint**: `GET /artifacts/list`
-- **Parameters**:
-  - `tag` (string, optional): The release tag (e.g., `v1.0.0`). Use this for Release builds.
-  - `id` (int, optional): The GitHub Run ID. Use this for CI builds.
-  - `commit_sha` (string, optional): The commit SHA. Use this for CI builds.
-  - `wow64` (boolean, optional): Set to `true` to list 32-bit artifacts. Defaults to `false` (64-bit).
-  - `arm64ec` (boolean, optional): Set to `true` to list ARM64EC CI artifacts. Defaults to `false`. With `tag`, `true` returns an empty list.
-- **Response**: A JSON object containing a list of artifact details.
+### Errors
 
-CI queries filter both flags independently:
+Invalid sources, architectures, filters, or pagination return `422`. A missing build or file returns `404`. Empty searches return `200` with `items: []`. Errors share the shape:
 
-| `wow64` | `arm64ec` | Files |
-|---|---|---|
-| `false` | `false` | x64 |
-| `true` | `false` | i386 (Wow64) |
-| `false` | `true` | ARM64EC DLLs and the arm64 Unix library |
-| `true` | `true` | No matching files in current CI artifacts |
+```json
+{"error":{"code":"build_not_found","message":"No mirrored ci build found for 123","details":[]}}
+```
 
-ARM64EC CI files use the S3 prefix `dxmt-artifacts/arm64ec/builtin/`. Existing x64 and Wow64 paths remain unchanged.
-
-#### Download Build Artifact (CI)
-
-Download a specific artifact from a CI build. This endpoint redirects to a temporary, presigned S3 URL.
-
-- **Endpoint**: `GET /builds/download/{github_run_id}/artifact/{artifact_name}`
-- **Path Parameters**:
-  - `github_run_id` (int): The GitHub Action Run ID.
-  - `artifact_name` (string): The name of the file to download (e.g., `d3d11.dll`).
-- **Query Parameters**:
-  - `wow64` (boolean, optional): Set to `true` if downloading a 32-bit artifact. Defaults to `false`.
-  - `arm64ec` (boolean, optional): Set to `true` for an ARM64EC CI artifact. Defaults to `false`.
-
-#### Download Release Artifact
-
-Download a specific artifact from a Release. This endpoint redirects to a temporary, presigned S3 URL.
-
-- **Endpoint**: `GET /artifacts/download/{tag}/artifact/{artifact_name}`
-- **Path Parameters**:
-  - `tag` (string): The release tag (e.g., `v0.3`).
-  - `artifact_name` (string): The name of the file to download.
-- **Query Parameters**:
-  - `wow64` (boolean, optional): Set to `true` if downloading a 32-bit artifact. Defaults to `false`.
+Validation errors use `code: "invalid_request"`; `details` contains the failing location, message, and validation type. Internal errors return a generic `500` response without exposing server details. Legacy `/artifacts/*`, `/builds/list`, download routes, and boolean architecture query parameters have been removed.
 
 ## Deployment
 

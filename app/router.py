@@ -1,86 +1,72 @@
-from typing import Optional
+from typing import Annotated
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, Path, Query
 from fastapi.routing import APIRouter
 from fastapi.responses import RedirectResponse
 from sqlmodel import Session
 
 from .utils import get_db, get_bucket_name, get_endpoint_url
 from .artifact_manager import DXMTArtifactManager
+from .errors import APIError
+from .models.api import (
+    Architecture, BuildDetail, BuildDetailQuery, BuildListQuery, BuildPage,
+    BuildSource, BuildSummary, EmptyQuery, ErrorResponse, HealthResponse,
+)
 
 router = APIRouter()
-artifact_router = APIRouter(prefix="/artifacts")
-build_router = APIRouter(prefix="/builds")
+build_router = APIRouter(prefix="/builds", tags=["Builds"], responses={
+    404: {"model": ErrorResponse, "description": "Build or file not found"},
+    422: {"model": ErrorResponse, "description": "Invalid request"},
+    500: {"model": ErrorResponse, "description": "Internal server error"},
+})
 
 def get_artifact_manager(session: Session = Depends(get_db)):
     return DXMTArtifactManager(session, bucket_name=get_bucket_name(), endpoint_url=get_endpoint_url())
 
-@router.get("/health")
-async def health_check():
-    return {"status": "ok"}
+@router.get("/health", response_model=HealthResponse, tags=["Health"])
+def health_check() -> HealthResponse:
+    return HealthResponse()
 
 
-@artifact_router.get("/list")
-async def list_artifacts(
-    tag: Optional[str] = None,
-    id: Optional[int] = None,
-    commit_sha: Optional[str] = None,
-    wow64: bool = False,
-    arm64ec: bool = False,
-    manager: DXMTArtifactManager = Depends(get_artifact_manager)
-):
-    if not tag and not id and not commit_sha:
-        return {"error": "At least one of tag, id, or commit_sha must be provided"}
-    if tag and (id or commit_sha):
-        return {"error": "tag cannot be combined with id or commit_sha"}
-    if id and commit_sha:
-        return {"error": "id cannot be combined with commit_sha"}
-
-    artifacts = manager.list_artifacts(tag=tag, id=id, commit_sha=commit_sha, wow64=wow64, arm64ec=arm64ec)
-    return {"artifacts": artifacts}
+Manager = Annotated[DXMTArtifactManager, Depends(get_artifact_manager)]
 
 
-@build_router.get("/list")
-async def list_builds(
-    page: int = 1,
-    page_size: int = 10,
-    manager: DXMTArtifactManager = Depends(get_artifact_manager)
-):
-    builds = manager.list_builds(page=page, page_size=page_size)
-    return {"builds": builds}
+def require_build(manager: DXMTArtifactManager, source: BuildSource, ref: str):
+    build = manager.get_build(source, ref)
+    if build is None:
+        raise APIError(404, "build_not_found", f"No mirrored {source.value} build found for {ref}")
+    return build
 
 
-@build_router.get("/download/{github_run_id}/artifact/{artifact_name}")
-async def download_build_artifact(
-    github_run_id: int,
-    artifact_name: str,
-    wow64: bool = False,
-    arm64ec: bool = False,
-    manager: DXMTArtifactManager = Depends(get_artifact_manager)
-):
-    # Find the artifact
-    artifacts = manager.list_artifacts(id=github_run_id, wow64=wow64, arm64ec=arm64ec)
-    target_artifact = next((a for a in artifacts if a.name == artifact_name), None)
+@build_router.get("", response_model=BuildPage, summary="List mirrored builds")
+def list_builds(filters: Annotated[BuildListQuery, Query()], manager: Manager) -> BuildPage:
+    builds, total = manager.list_builds(filters)
+    return BuildPage(
+        items=[BuildSummary.from_build(build) for build in builds], page=filters.page,
+        per_page=filters.per_page, total=total, has_more=filters.page*filters.per_page < total,
+    )
 
-    if not target_artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
 
-    download_url = manager.get_presigned_url(target_artifact)
-    return RedirectResponse(url=download_url)
+@build_router.get(
+    "/{source}/{ref:path}/files/{arch}/{name}", name="download_file", response_class=RedirectResponse,
+    summary="Download a mirrored file", status_code=307,
+    responses={307: {"description": "Redirect to a temporary signed storage URL", "headers": {"Location": {"schema": {"type": "string", "format": "uri"}}}}},
+)
+def download_file(
+    source: BuildSource, ref: Annotated[str, Path(min_length=1)], arch: Architecture,
+    name: Annotated[str, Path(min_length=1, max_length=255, pattern=r"^[^/\\\x00]+$")],
+    query: Annotated[EmptyQuery, Query()], manager: Manager,
+) -> RedirectResponse:
+    build = require_build(manager, source, ref)
+    artifact = manager.get_file(build, arch, name)
+    if artifact is None:
+        raise APIError(404, "file_not_found", f"No {arch.value} file named {name} in {source.value} build {ref}")
+    return RedirectResponse(manager.get_presigned_url(artifact), headers={"Cache-Control": "no-store"})
 
-@artifact_router.get("/download/{tag}/artifact/{artifact_name}")
-async def download_release_artifact(
-    tag: str,
-    artifact_name: str,
-    wow64: bool = False,
-    manager: DXMTArtifactManager = Depends(get_artifact_manager)
-):
-    # Find the artifact
-    artifacts = manager.list_artifacts(tag=tag, wow64=wow64)
-    target_artifact = next((a for a in artifacts if a.name == artifact_name), None)
 
-    if not target_artifact:
-        raise HTTPException(status_code=404, detail="Artifact not found")
-
-    download_url = manager.get_presigned_url(target_artifact)
-    return RedirectResponse(url=download_url)
+@build_router.get("/{source}/{ref:path}", response_model=BuildDetail, name="get_build", summary="Inspect a mirrored build")
+def get_build(
+    source: BuildSource, ref: Annotated[str, Path(min_length=1)],
+    filters: Annotated[BuildDetailQuery, Query()], manager: Manager,
+) -> BuildDetail:
+    return BuildDetail.from_build(require_build(manager, source, ref), filters.arch)
