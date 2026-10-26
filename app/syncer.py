@@ -3,10 +3,12 @@ import logging
 import tarfile
 import tempfile
 import zipfile
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from requests import HTTPError
 from sqlmodel import Session, select, col
 
 from .artifact_manager import DXMTArtifactManager
@@ -18,6 +20,7 @@ from .utils import get_endpoint_url
 logger = logging.getLogger(__name__)
 
 class ArtifactSyncer:
+    BACKFILL_BATCH_SIZE = 5
     CI_ARTIFACT_NAMES = (
         "clang-release-x86_64-windows-cross",
         "clang-release-x86-windows-cross",
@@ -30,6 +33,7 @@ class ArtifactSyncer:
         self.bucket_name = bucket_name
         self.owner = "3Shain"
         self.repo = "dxmt"
+        self._backfill_run_ids: Optional[deque[int]] = None
 
     async def sync_loop(self):
         while True:
@@ -47,7 +51,30 @@ class ArtifactSyncer:
             artifact_manager = DXMTArtifactManager(session, self.bucket_name, endpoint_url=get_endpoint_url())
             self.sync_builtin_builds(session, artifact_manager)
             self.sync_releases(session, artifact_manager)
+            self.backfill_builtin_builds(session, artifact_manager)
         logger.info("Sync cycle completed.")
+
+    def backfill_builtin_builds(self, session: Session, artifact_manager: DXMTArtifactManager):
+        if self._backfill_run_ids is None:
+            self._backfill_run_ids = deque(session.exec(
+                select(BuiltinBuild.github_run_id).order_by(col(BuiltinBuild.created_at).desc())
+            ).all())
+        if not self._backfill_run_ids:
+            return
+
+        for _ in range(min(self.BACKFILL_BATCH_SIZE, len(self._backfill_run_ids))):
+            run_id = self._backfill_run_ids.popleft()
+            build = session.get(BuiltinBuild, run_id)
+            if build is None:
+                continue
+            try:
+                self._sync_builtin_artifacts(build, session, artifact_manager)
+            except Exception:
+                session.rollback()
+                self._backfill_run_ids.append(run_id)
+                logger.error(f"Failed to backfill CI run {run_id}; will retry", exc_info=True)
+
+        logger.info(f"CI backfill: {len(self._backfill_run_ids)} runs remaining")
 
     def sync_builtin_builds(self, session: Session, artifact_manager: DXMTArtifactManager):
         logger.info("Syncing builtin builds...")
@@ -117,9 +144,15 @@ class ArtifactSyncer:
         source_artifacts = []
         page = 1
         while True:
-            response = self.github_client.get_run_artifacts(
-                self.owner, self.repo, build.github_run_id, per_page=100, page=page,
-            )
+            try:
+                response = self.github_client.get_run_artifacts(
+                    self.owner, self.repo, build.github_run_id, per_page=100, page=page,
+                )
+            except HTTPError as error:
+                if error.response is not None and error.response.status_code in (404, 410):
+                    logger.info(f"Run {build.github_run_id} is no longer available. Skipping.")
+                    return
+                raise
             source_artifacts.extend(response.artifacts)
             if not response.artifacts or len(source_artifacts) >= response.total_count:
                 break
@@ -146,7 +179,13 @@ class ArtifactSyncer:
                 # Download artifact zip
                 logger.info(f"Downloading artifact {artifact.name} from run {build.github_run_id}")
                 zip_path = temp_path / f"{artifact.name}.zip"
-                self.github_client.download_artifact(zip_path, self.owner, self.repo, artifact.id)
+                try:
+                    self.github_client.download_artifact(zip_path, self.owner, self.repo, artifact.id)
+                except HTTPError as error:
+                    if error.response is not None and error.response.status_code in (404, 410):
+                        logger.info(f"Artifact {artifact.name} is no longer available. Skipping.")
+                        continue
+                    raise
 
                 # Extract zip
                 extract_dir = temp_path / artifact.name

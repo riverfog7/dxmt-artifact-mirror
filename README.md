@@ -21,6 +21,10 @@ CI mirroring selects only unexpired Clang release artifacts:
 
 Combined, GCC, debugoptimized, and native macOS CI archives are not selected. Missing or expired Clang sources are skipped. Tagged releases continue to use their published upstream tarballs.
 
+On each startup, a backfill revisits existing CI builds, newest first, five builds per sync cycle alongside normal polling. It checks GitHub artifact expiry directly, including for builds older than the normal 100-day new-run window. Available Clang files replace existing GCC files at the same URLs; ARM64EC files and `d3d12.dll` are added when supplied. Missing or expired sources leave existing files intact.
+
+Source artifact IDs are saved after all uploads for a build succeed. Repeated backfills, including after restarting, skip downloads for completed sources and update existing file records without duplication. Failed imports are rolled back and queued for a later cycle. Historical builds without `d3d12.dll` are not repeatedly downloaded just because that file is absent. The backfill stops inspecting old runs once its queue is complete and starts a new pass on the next service startup.
+
 ## API Documentation
 
 ### Base URL
@@ -124,5 +128,5 @@ At startup, existing databases are automatically migrated before syncing. The mi
 
 ## Tests
 
-Run the focused database and API checks with `uv run python -m unittest discover -s tests -v`.
+Run the database, API, import, and backfill checks with `uv run python -m unittest discover -s tests -v`.
 
