@@ -7,9 +7,19 @@ This service mirrors artifacts from the [DXMT](https://github.com/3Shain/dxmt) p
 - **Automatic Sync**: Periodically checks for new GitHub Actions runs and Releases.
 - **Artifact Mirroring**: Downloads and stores artifacts in an S3-compatible storage.
 - **Wow64 Support**: Distinguishes between 64-bit and 32-bit (Wow64) artifacts.
-- **ARM64EC Selection**: CI artifact metadata and download queries distinguish ARM64EC from x64 and Wow64 files.
+- **ARM64EC Support**: Mirrors ARM64EC DLLs and the arm64 Unix library separately from x64 and Wow64 files.
 - **Fast Downloads**: Serves artifacts via presigned S3 URLs for optimal performance.
 - **API Access**: Provides a REST API to list builds, artifacts, and generate download links.
+
+## CI Sources
+
+CI mirroring selects only unexpired Clang release artifacts:
+
+- `clang-release-x86_64-windows-cross`: x64 DLLs (including `d3d12.dll` when provided) and the x64 Unix library.
+- `clang-release-x86-windows-cross`: i386 DLLs for Wow64.
+- `clang-release-arm64ec-windows-cross`: ARM64EC DLLs and the arm64 Unix library.
+
+Combined, GCC, debugoptimized, and native macOS CI archives are not selected. Missing or expired Clang sources are skipped. Tagged releases continue to use their published upstream tarballs.
 
 ## API Documentation
 

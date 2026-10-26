@@ -18,6 +18,12 @@ from .utils import get_endpoint_url
 logger = logging.getLogger(__name__)
 
 class ArtifactSyncer:
+    CI_ARTIFACT_NAMES = (
+        "clang-release-x86_64-windows-cross",
+        "clang-release-x86-windows-cross",
+        "clang-release-arm64ec-windows-cross",
+    )
+
     def __init__(self, github_client: GitHubAPIClient, engine, bucket_name: str):
         self.github_client = github_client
         self.engine = engine
@@ -92,28 +98,53 @@ class ArtifactSyncer:
 
     def _process_builtin_run(self, run: GitHubActionRun, session: Session, artifact_manager: DXMTArtifactManager):
         logger.info(f"Processing new run: {run.id}")
+        build = session.get(BuiltinBuild, run.id)
+        if build is None:
+            build = BuiltinBuild(
+                github_run_id=run.id,
+                commit_sha=run.head_sha,
+                description=run.display_title,
+                created_at=run.created_at,
+                artifact_count=0,
+            )
+        try:
+            self._sync_builtin_artifacts(build, session, artifact_manager)
+        except Exception:
+            session.rollback()
+            raise
 
-        # Fetch artifacts for this run
-        artifacts_response = self.github_client.get_run_artifacts(self.owner, self.repo, run.id)
+    def _sync_builtin_artifacts(self, build: BuiltinBuild, session: Session, artifact_manager: DXMTArtifactManager):
+        source_artifacts = []
+        page = 1
+        while True:
+            response = self.github_client.get_run_artifacts(
+                self.owner, self.repo, build.github_run_id, per_page=100, page=page,
+            )
+            source_artifacts.extend(response.artifacts)
+            if not response.artifacts or len(source_artifacts) >= response.total_count:
+                break
+            page += 1
 
-        if not artifacts_response.artifacts:
-            logger.info(f"Run {run.id} has no artifacts. Skipping.")
-            return
-
-        selected_artifacts = self._select_builtin_source_artifacts(run, artifacts_response.artifacts)
+        selected_artifacts = self._select_builtin_source_artifacts(source_artifacts)
         if not selected_artifacts:
-            logger.info(f"Run {run.id} has no compatible builtin artifacts. Skipping.")
+            logger.info(f"Run {build.github_run_id} has no unexpired Clang release artifacts. Skipping.")
             return
 
-        has_wow64 = False
+        existing_artifacts = session.exec(
+            select(BuiltinArtifact).where(BuiltinArtifact.build_id == build.github_run_id)
+        ).all()
+        artifacts_by_key = {(a.name, a.is_wow64, a.is_arm64ec): a for a in existing_artifacts}
+        imported_source_ids = {a.artifact_id for a in existing_artifacts}
         processed_artifacts = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
 
             for artifact in selected_artifacts:
+                if artifact.id in imported_source_ids:
+                    continue
                 # Download artifact zip
-                logger.info(f"Downloading artifact {artifact.name} from run {run.id}")
+                logger.info(f"Downloading artifact {artifact.name} from run {build.github_run_id}")
                 zip_path = temp_path / f"{artifact.name}.zip"
                 self.github_client.download_artifact(zip_path, self.owner, self.repo, artifact.id)
 
@@ -122,113 +153,49 @@ class ArtifactSyncer:
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(extract_dir)
 
-                combined_name = f"dxmt-{run.head_sha}"
-                if artifact.name == combined_name:
-                    collected_files = self._extract_combined_ci_artifact(extract_dir)
-                elif artifact.name == "artifacts-release-gcc":
-                    collected_files = self._extract_legacy_split_ci_artifact(extract_dir, is_wow64=False)
-                elif artifact.name == "artifacts-release-wow64-gcc":
-                    collected_files = self._extract_legacy_split_ci_artifact(extract_dir, is_wow64=True)
-                else:
-                    collected_files = self._extract_split_ci_artifact(extract_dir)
+                is_arm64ec = artifact.name == "clang-release-arm64ec-windows-cross"
+                collected_files = self._collect_runtime_files(extract_dir, arm64ec=is_arm64ec)
+                if not collected_files:
+                    raise ValueError(f"Artifact {artifact.name} has no runtime files")
 
                 for file_path, is_wow64 in collected_files:
-                    # Create DB object
-                    db_artifact = BuiltinArtifact(
-                        artifact_id=artifact.id,
-                        build_id=run.id,
-                        name=file_path.name,
-                        is_wow64=is_wow64
-                    )
+                    identity = (file_path.name, is_wow64, is_arm64ec)
+                    db_artifact = artifacts_by_key.get(identity)
+                    if db_artifact is None:
+                        db_artifact = BuiltinArtifact(
+                            artifact_id=artifact.id,
+                            build_id=build.github_run_id,
+                            name=file_path.name,
+                            is_wow64=is_wow64,
+                            is_arm64ec=is_arm64ec,
+                        )
+                        artifacts_by_key[identity] = db_artifact
 
                     # Upload to S3
                     key = artifact_manager._get_s3_key(db_artifact)
                     artifact_manager.s3_client.upload_file(str(file_path), artifact_manager.bucket_name, key)
-                    processed_artifacts.append(db_artifact)
-                    if is_wow64:
-                        has_wow64 = True
+                    processed_artifacts.append((db_artifact, artifact.id))
 
         if not processed_artifacts:
-            logger.info(f"Run {run.id} has no relevant artifacts. Skipping.")
             return
 
-        # Save build and artifacts to DB
-        build = BuiltinBuild(
-            github_run_id=run.id,
-            commit_sha=run.head_sha,
-            description=run.display_title,
-            created_at=run.created_at,
-            artifact_count=len(processed_artifacts),
-            has_wow64=has_wow64
-        )
-
+        # Source IDs are recorded only after every upload succeeds.
+        build.artifact_count = len(artifacts_by_key)
+        build.has_wow64 = any(a.is_wow64 for a in artifacts_by_key.values())
         session.add(build)
-        for art in processed_artifacts:
+        for art, source_id in processed_artifacts:
+            art.artifact_id = source_id
             session.add(art)
         session.commit()
-        logger.info(f"Saved run {run.id} with {len(processed_artifacts)} artifacts")
+        logger.info(f"Saved run {build.github_run_id} with {build.artifact_count} artifacts")
 
-    def _select_builtin_source_artifacts(self, run: GitHubActionRun, artifacts: list):
-        active_artifacts = [artifact for artifact in artifacts if not artifact.expired]
-        artifacts_by_name = {artifact.name: artifact for artifact in active_artifacts}
-
-        combined_name = f"dxmt-{run.head_sha}"
-        if combined_name in artifacts_by_name:
-            return [artifacts_by_name[combined_name]]
-
-        legacy_selected = []
-        for name in ("artifacts-release-gcc", "artifacts-release-wow64-gcc"):
-            artifact = artifacts_by_name.get(name)
-            if artifact:
-                legacy_selected.append(artifact)
-        if legacy_selected:
-            return legacy_selected
-
-        selected = []
-        for name in ("gcc-release-x86_64-windows-cross", "gcc-release-x86-windows-cross"):
-            artifact = artifacts_by_name.get(name)
-            if artifact:
-                selected.append(artifact)
-        return selected
-
-    def _extract_combined_ci_artifact(self, extract_dir: Path) -> list[tuple[Path, bool]]:
-        tar_files = sorted(extract_dir.glob("*.tar.gz"))
-        if not tar_files:
-            logger.warning(f"No combined tarball found in artifact directory {extract_dir}")
-            return []
-
-        tar_path = tar_files[0]
-        tar_extract_dir = extract_dir / "tar_extracted"
-        with tarfile.open(tar_path, "r:gz") as tar_ref:
-            tar_ref.extractall(tar_extract_dir)
-
-        runtime_root = self._find_single_top_level_dir(tar_extract_dir)
-        if runtime_root is None:
-            logger.warning(f"Combined artifact tarball {tar_path.name} did not extract to a single top-level directory")
-            return []
-
-        return self._collect_runtime_files(runtime_root)
-
-    def _extract_split_ci_artifact(self, extract_dir: Path) -> list[tuple[Path, bool]]:
-        return self._collect_runtime_files(extract_dir)
-
-    def _extract_legacy_split_ci_artifact(self, extract_dir: Path, is_wow64: bool) -> list[tuple[Path, bool]]:
-        tar_files = sorted(extract_dir.glob("*.tar.gz"))
-        if not tar_files:
-            logger.warning(f"No legacy tarball found in artifact directory {extract_dir}")
-            return []
-
-        tar_path = tar_files[0]
-        tar_extract_dir = extract_dir / "tar_extracted"
-        with tarfile.open(tar_path, "r:gz") as tar_ref:
-            tar_ref.extractall(tar_extract_dir)
-
-        runtime_root = self._find_legacy_runtime_root(tar_extract_dir)
-        if runtime_root is None:
-            logger.warning(f"Legacy artifact tarball {tar_path.name} did not extract to a build-release*/src directory")
-            return []
-
-        return self._collect_legacy_runtime_files(runtime_root, is_wow64=is_wow64)
+    def _select_builtin_source_artifacts(self, artifacts: list):
+        artifacts_by_name = {
+            artifact.name: artifact
+            for artifact in sorted(artifacts, key=lambda a: a.id)
+            if not artifact.expired
+        }
+        return [artifacts_by_name[name] for name in self.CI_ARTIFACT_NAMES if name in artifacts_by_name]
 
     def _find_single_top_level_dir(self, root: Path) -> Optional[Path]:
         directories = [path for path in root.iterdir() if path.is_dir()]
@@ -236,50 +203,17 @@ class ArtifactSyncer:
             return directories[0]
         return None
 
-    def _find_legacy_runtime_root(self, root: Path) -> Optional[Path]:
-        top_level_dir = self._find_single_top_level_dir(root)
-        if top_level_dir is None:
-            return None
-
-        runtime_root = top_level_dir / "src"
-        if runtime_root.is_dir():
-            return runtime_root
-        return None
-
-    def _collect_runtime_files(self, runtime_root: Path) -> list[tuple[Path, bool]]:
+    def _collect_runtime_files(self, runtime_root: Path, arm64ec: bool = False) -> list[tuple[Path, bool]]:
         collected = []
-
-        i386_dir = runtime_root / "i386-windows"
-        if i386_dir.is_dir():
-            for file_path in i386_dir.rglob("*"):
-                if file_path.is_file() and file_path.suffix == ".dll":
-                    collected.append((file_path, True))
-
-        x64_windows_dir = runtime_root / "x86_64-windows"
-        if x64_windows_dir.is_dir():
-            for file_path in x64_windows_dir.rglob("*"):
-                if file_path.is_file() and file_path.suffix == ".dll":
-                    collected.append((file_path, False))
-
-        x64_unix_dir = runtime_root / "x86_64-unix"
-        if x64_unix_dir.is_dir():
-            for file_path in x64_unix_dir.rglob("*"):
-                if file_path.is_file() and file_path.suffix == ".so":
-                    collected.append((file_path, False))
-
-        return collected
-
-    def _collect_legacy_runtime_files(self, runtime_root: Path, is_wow64: bool) -> list[tuple[Path, bool]]:
-        collected = []
-
-        for file_path in runtime_root.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if file_path.suffix == ".dll":
-                collected.append((file_path, is_wow64))
-            elif not is_wow64 and file_path.suffix == ".so":
-                collected.append((file_path, False))
-
+        directories = (
+            (("aarch64-windows", ".dll", False), ("aarch64-unix", ".so", False))
+            if arm64ec else
+            (("i386-windows", ".dll", True), ("x86_64-windows", ".dll", False), ("x86_64-unix", ".so", False))
+        )
+        for directory, suffix, is_wow64 in directories:
+            for file_path in sorted((runtime_root / directory).rglob("*")):
+                if file_path.is_file() and file_path.suffix == suffix:
+                    collected.append((file_path, is_wow64))
         return collected
 
     def sync_releases(self, session: Session, artifact_manager: DXMTArtifactManager):
