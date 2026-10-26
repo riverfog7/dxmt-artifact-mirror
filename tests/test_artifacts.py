@@ -131,7 +131,7 @@ class ArtifactAPITests(unittest.TestCase):
         self.assertFalse(second["has_more"])
         self.assertEqual(second["items"][0]["file_count"], 4)
         for build in response.json()["items"] + second["items"]:
-            self.assertEqual(set(build), {"source", "ref", "created_at", "commit_sha", "description", "architectures", "file_count"})
+            self.assertEqual(set(build), {"source", "ref", "url", "created_at", "commit_sha", "description", "architectures", "file_count"})
             self.assertTrue(build["created_at"].endswith("Z"))
         beyond = self.client.get("/builds", params={"page": 100}).json()
         self.assertEqual((beyond["items"], beyond["total"], beyond["has_more"]), ([], 4, False))
@@ -164,7 +164,10 @@ class ArtifactAPITests(unittest.TestCase):
         self.assertEqual(len(build.files), 4)
         self.assertEqual({a.name for a in build.files}, {"d3d11.dll", "d3d12.dll"})
         selected = self.client.get("/builds/ci/7", params={"arch": "arm64ec"}).json()
-        self.assertEqual(selected["files"], [{"name": "d3d11.dll", "arch": "arm64ec"}])
+        self.assertEqual(selected["files"], [{
+            "name": "d3d11.dll", "arch": "arm64ec",
+            "download_url": "http://testserver/builds/ci/7/files/arm64ec/d3d11.dll",
+        }])
         self.assertEqual(selected["file_count"], 4)
         release = self.client.get("/builds/release/v0.80").json()
         self.assertEqual(set(release), set(response.json()))
@@ -221,6 +224,91 @@ class ArtifactAPITests(unittest.TestCase):
         for status, model in (("200", "BuildPage"), ("422", "ErrorResponse")):
             self.assertEqual(operation["responses"][status]["content"]["application/json"]["schema"]["$ref"], f"#/components/schemas/{model}")
         self.assertEqual(self.client.get("/health").json(), {"status": "ok"})
+
+    def test_latest_selects_matching_available_files_and_returns_canonical_links(self):
+        cases = (
+            ("/builds/ci/latest", {}, "8"),
+            ("/builds/ci/latest", {"arch": "arm64ec"}, "7"),
+            ("/builds/ci/latest", {"arch": "x86_64", "file": "d3d12.dll"}, "7"),
+            ("/builds/release/latest", {}, "v0.80"),
+        )
+        for path, params, ref in cases:
+            with self.subTest(path=path, params=params):
+                response = self.client.get(path, params=params)
+                self.assertEqual(response.status_code, 200, response.text)
+                build = BuildDetail.model_validate(response.json())
+                self.assertEqual(build.ref, ref)
+                self.assertEqual(str(build.url), f"http://testserver/builds/{build.source.value}/{ref}")
+                self.assertEqual(response.headers["cache-control"], "no-store")
+                for file in build.files:
+                    self.assertIn(f"/{ref}/files/", str(file.download_url))
+                    if params.get("arch"):
+                        self.assertEqual(file.arch.value, params["arch"])
+        self.s3.generate_presigned_url.assert_not_called()
+
+    def test_latest_arch_and_file_must_match_the_same_record(self):
+        self.session.add(BuiltinBuild(
+            github_run_id=9, commit_sha="0"*40, description="newer build",
+            created_at=datetime(2026, 10, 26, tzinfo=timezone.utc), artifact_count=2,
+        ))
+        self.session.add(BuiltinArtifact(artifact_id=301, build_id=9, name="d3d12.dll", is_wow64=True))
+        self.session.add(BuiltinArtifact(artifact_id=302, build_id=9, name="d3d11.dll"))
+        self.session.commit()
+        any_arch = self.client.get("/builds/ci/latest", params={"file": "d3d12.dll"})
+        self.assertEqual(any_arch.json()["ref"], "9")
+        x64 = self.client.get("/builds/ci/latest", params={"arch": "x86_64", "file": "d3d12.dll"})
+        self.assertEqual(x64.json()["ref"], "7")
+
+    def test_latest_missing_matches_and_bad_filters_are_explicit(self):
+        for path, params in (
+            ("/builds/ci/latest", {"file": "missing.dll"}),
+            ("/builds/release/latest", {"arch": "arm64ec"}),
+        ):
+            self.assert_error(self.client.get(path, params=params), 404, "build_not_found")
+        for params in ({"arch": "arm64"}, {"file": "dir/d3d11.dll"}, {"wow64": True}):
+            self.assert_error(self.client.get("/builds/ci/latest", params=params), 422, "invalid_request")
+
+    def test_latest_download_alias_resolves_a_build_containing_the_file(self):
+        response = self.client.get("/builds/ci/latest/files/x86_64/d3d12.dll", follow_redirects=False)
+        self.assertEqual(response.status_code, 307, response.text)
+        self.assertEqual(response.headers["location"], "https://storage.test/dxmt-artifacts/builtin/7/d3d12.dll")
+        response = self.client.get("/builds/release/latest/files/x86/d3d11.dll", follow_redirects=False)
+        self.assertEqual(response.headers["location"], "https://storage.test/dxmt-artifacts/wow64/release/v0.80/d3d11.dll")
+        self.assert_error(self.client.get("/builds/ci/latest/files/x86/missing.dll"), 404, "build_not_found")
+
+    def test_returned_build_and_file_links_can_be_followed(self):
+        page = self.client.get("/builds", params={"source": "ci"}).json()
+        for summary in page["items"]:
+            response = self.client.get(summary["url"])
+            self.assertEqual(response.status_code, 200)
+            build = response.json()
+            self.assertEqual(build["ref"], summary["ref"])
+            for file in build["files"]:
+                download = self.client.get(file["download_url"], follow_redirects=False)
+                self.assertEqual(download.status_code, 307)
+
+    def test_links_roundtrip_encoded_tags_and_filenames(self):
+        tag, name = "feature/日本+%#1", "helper #1.dll"
+        self.session.add(ReleaseBuild(tag=tag, created_at=datetime.now(timezone.utc), artifact_count=1))
+        self.session.add(ReleaseArtifact(build_tag=tag, name=name))
+        self.session.commit()
+        page = self.client.get("/builds", params={"source": "release"}).json()
+        summary = next(b for b in page["items"] if b["ref"] == tag)
+        detail = self.client.get(summary["url"])
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["ref"], tag)
+        response = self.client.get(detail.json()["files"][0]["download_url"], follow_redirects=False)
+        self.assertEqual(response.status_code, 307, response.text)
+        self.assertEqual(self.s3.generate_presigned_url.call_args.kwargs["Params"]["Key"], f"dxmt-artifacts/release/{tag}/{name}")
+
+    def test_links_respect_the_deployment_root_path(self):
+        self.api.root_path = "/mirror"
+        response = self.client.get("/builds/ci/7")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["url"], "http://testserver/mirror/builds/ci/7")
+        file_url = response.json()["files"][0]["download_url"]
+        self.assertTrue(file_url.startswith("http://testserver/mirror/builds/ci/7/files/"))
+        self.assertEqual(self.client.get(file_url, follow_redirects=False).status_code, 307)
 
     def test_s3_prefixes_compose_independently(self):
         for wow64, arm64ec, prefix in (

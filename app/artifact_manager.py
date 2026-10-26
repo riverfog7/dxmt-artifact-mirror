@@ -6,7 +6,7 @@ import boto3
 
 
 from .models.builds import BuiltinBuild, ReleaseBuild, BuiltinArtifact, ReleaseArtifact
-from .models.api import Architecture, BuildFilters, BuildListQuery, BuildSource
+from .models.api import Architecture, BuildFilters, BuildListQuery, BuildSource, LatestBuildQuery
 
 
 class DXMTArtifactManager:
@@ -54,7 +54,7 @@ class DXMTArtifactManager:
             conditions.append(false())
         return and_(*conditions)
 
-    def _build_query(self, filters: BuildFilters, source: BuildSource | None):
+    def _build_query(self, filters: BuildFilters, source: BuildSource | None, file: str | None = None, require_files: bool = False):
         queries = []
         for kind, model, artifact_model, key, foreign_key in (
             (BuildSource.CI, BuiltinBuild, BuiltinArtifact, BuiltinBuild.github_run_id, BuiltinArtifact.build_id),
@@ -68,10 +68,12 @@ class DXMTArtifactManager:
             )
             if filters.commit:
                 query = query.where(BuiltinBuild.commit_sha == filters.commit)
-            if filters.arch is not None:
-                files = select(artifact_model.id).where(
-                    foreign_key == key, self._architecture_filter(artifact_model, filters.arch),
-                )
+            if filters.arch is not None or file is not None or require_files:
+                files = select(artifact_model.id).where(foreign_key == key)
+                if filters.arch is not None:
+                    files = files.where(self._architecture_filter(artifact_model, filters.arch))
+                if file is not None:
+                    files = files.where(artifact_model.name == file)
                 query = query.where(files.exists())
             queries.append(query)
         return union_all(*queries).subquery()
@@ -105,6 +107,12 @@ class DXMTArtifactManager:
             self._ordered_builds(query).limit(filters.per_page).offset((filters.page-1)*filters.per_page)
         ).all()
         return self._load_builds(rows), total
+
+    def get_latest_build(self, source: BuildSource, filters: LatestBuildQuery) -> BuiltinBuild | ReleaseBuild | None:
+        query = self._build_query(BuildFilters(arch=filters.arch), source, file=filters.file, require_files=True)
+        rows = self.db_session.exec(self._ordered_builds(query).limit(1)).all()
+        builds = self._load_builds(rows)
+        return builds[0] if builds else None
 
     def get_build(self, source: BuildSource, ref: str) -> BuiltinBuild | ReleaseBuild | None:
         if source == BuildSource.CI:

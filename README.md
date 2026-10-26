@@ -43,13 +43,25 @@ The public API uses `source=ci|release` and `arch=x86|x86_64|arm64ec`. `x86` sel
 | `GET /builds/ci/{run_id}` | CI metadata and files |
 | `GET /builds/release/{tag}` | Release metadata and files |
 | `GET /builds/ci/{run_id}?arch=x86_64` | Build metadata with only x64 files in `files` |
+| `GET /builds/ci/latest?arch=x86_64&file=d3d12.dll` | Newest CI build with x64 `d3d12.dll` |
+| `GET /builds/release/latest?arch=x86_64` | Newest release with x64 files |
 | `GET /health` | `{"status":"ok"}` |
 
 `GET /builds` accepts `source`, `arch`, `commit`, `page` (default 1, minimum 1), and `per_page` (default 20, range 1–100). `commit` is a full 40-character SHA and applies only to CI builds. Unknown query parameters are rejected. Ordering uses creation time descending, source, CI run ID descending, then reference descending so ties are deterministic.
 
-List responses contain `items`, `page`, `per_page`, `total`, and `has_more`. Both CI and release summaries use the same fields: `source`, `ref`, `created_at` (UTC), `commit_sha`, `description`, `architectures`, and `file_count`. `ref` is the run ID as a string or the release tag. Release `commit_sha` and `description` are `null`. Counts and available architectures come from mirrored file records, including files retained after their upstream artifacts expire.
+List responses contain `items`, `page`, `per_page`, `total`, and `has_more`. Both CI and release summaries use the same fields: `source`, `ref`, `url`, `created_at` (UTC), `commit_sha`, `description`, `architectures`, and `file_count`. `ref` is the run ID as a string or the release tag; `url` links to its build details. Release `commit_sha` and `description` are `null`. Counts and available architectures come from mirrored file records, including files retained after their upstream artifacts expire.
 
-Build details add a `files` array with `name` and `arch`. An `arch` filter narrows this array; metadata still describes the entire build. Existing builds with no files for that architecture return an empty array.
+Build details add a `files` array with `name`, `arch`, and `download_url`. Follow these links instead of constructing paths. An `arch` filter narrows this array; metadata still describes the entire build. Existing builds with no files for that architecture return an empty array. For example, a file entry is:
+
+```json
+{
+  "name": "d3d12.dll",
+  "arch": "x86_64",
+  "download_url": "http://localhost:8000/builds/ci/39904585849/files/x86_64/d3d12.dll"
+}
+```
+
+`latest` is a reserved build reference. Latest lookup accepts optional `arch` and `file` filters and selects the newest build containing a matching file record, skipping builds without files. With both filters, the file must exist in that architecture. These filters select the build; `arch` also filters the returned `files` array. Latest responses include canonical build and file links with the resolved run ID or tag and use `Cache-Control: no-store`. CI lookup covers all mirrored runs, including pull requests; it does not imply a main-branch build.
 
 ### Download Files
 
@@ -57,12 +69,17 @@ Build details add a `files` array with `name` and `arch`. An `arch` filter narro
 |---|---|
 | `GET /builds/ci/{run_id}/files/{arch}/{name}` | Download a CI file |
 | `GET /builds/release/{tag}/files/{arch}/{name}` | Download a release file |
+| `GET /builds/ci/latest/files/{arch}/{name}` | Download the newest matching CI file |
+| `GET /builds/release/latest/files/{arch}/{name}` | Download the newest matching release file |
 
 Downloads return HTTP 307 with a temporary signed S3 URL in `Location`. Redirects are marked `Cache-Control: no-store`. For example:
 
 ```sh
 curl -fL -o d3d12.dll http://localhost:8000/builds/ci/39904585849/files/x86_64/d3d12.dll
+curl -fL -o d3d12.dll http://localhost:8000/builds/ci/latest/files/x86_64/d3d12.dll
 ```
+
+Metadata links are stable API URLs. Signed storage URLs are generated only on download; metadata requests do not access S3. Returned links respect the deployment root path and encode tags and file names.
 
 ### Errors
 

@@ -1,10 +1,13 @@
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Callable, Literal
+from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 from .builds import BuiltinArtifact, BuiltinBuild, ReleaseArtifact, ReleaseBuild
+
+FileName = Annotated[str, StringConstraints(min_length=1, max_length=255, pattern=r"^[^/\\\x00]+$")]
 
 
 class BuildSource(StrEnum):
@@ -56,22 +59,28 @@ class BuildDetailQuery(BaseModel):
     arch: Architecture | None = None
 
 
+class LatestBuildQuery(BuildDetailQuery):
+    file: FileName | None = Field(default=None, description="Require this file in the selected architecture, or any architecture if arch is omitted.")
+
+
 class EmptyQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
 class BuildFile(BaseModel):
-    name: str
+    name: FileName
     arch: Architecture
+    download_url: AnyHttpUrl
 
     @classmethod
-    def from_artifact(cls, artifact: BuiltinArtifact | ReleaseArtifact) -> "BuildFile":
-        return cls(name=artifact.name, arch=Architecture.of(artifact))
+    def from_artifact(cls, artifact: BuiltinArtifact | ReleaseArtifact, download_url: str) -> "BuildFile":
+        return cls(name=artifact.name, arch=Architecture.of(artifact), download_url=download_url)
 
 
 class BuildSummary(BaseModel):
     source: BuildSource
     ref: str = Field(description="CI run ID or release tag.")
+    url: AnyHttpUrl
     created_at: datetime
     commit_sha: str | None
     description: str | None
@@ -86,11 +95,14 @@ class BuildSummary(BaseModel):
         return value.astimezone(timezone.utc)
 
     @classmethod
-    def from_build(cls, build: BuiltinBuild | ReleaseBuild) -> "BuildSummary":
+    def from_build(cls, build: BuiltinBuild | ReleaseBuild, url_for: Callable[..., str]) -> "BuildSummary":
         is_ci = isinstance(build, BuiltinBuild)
+        source = BuildSource.CI if is_ci else BuildSource.RELEASE
+        ref = str(build.github_run_id) if is_ci else build.tag
         return cls(
-            source=BuildSource.CI if is_ci else BuildSource.RELEASE,
-            ref=str(build.github_run_id) if is_ci else build.tag,
+            source=source,
+            ref=ref,
+            url=url_for("get_build", source=source.value, ref=quote(ref, safe="")),
             created_at=build.created_at,
             commit_sha=build.commit_sha if is_ci else None,
             description=build.description if is_ci else None,
@@ -103,9 +115,14 @@ class BuildDetail(BuildSummary):
     files: list[BuildFile]
 
     @classmethod
-    def from_build(cls, build: BuiltinBuild | ReleaseBuild, arch: Architecture | None = None) -> "BuildDetail":
-        summary = BuildSummary.from_build(build)
-        files = [BuildFile.from_artifact(a) for a in build.artifacts if arch is None or Architecture.of(a) == arch]
+    def from_build(
+        cls, build: BuiltinBuild | ReleaseBuild, url_for: Callable[..., str], arch: Architecture | None = None,
+    ) -> "BuildDetail":
+        summary = BuildSummary.from_build(build, url_for)
+        files = [BuildFile.from_artifact(a, download_url=url_for(
+            "download_file", source=summary.source.value, ref=quote(summary.ref, safe=""),
+            arch=Architecture.of(a).value, name=quote(a.name, safe=""),
+        )) for a in build.artifacts if arch is None or Architecture.of(a) == arch]
         return cls(**summary.model_dump(), files=sorted(files, key=lambda f: (f.arch, f.name)))
 
 

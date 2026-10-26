@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import Depends, Path, Query
+from fastapi import Depends, Path, Query, Request, Response
 from fastapi.routing import APIRouter
 from fastapi.responses import RedirectResponse
 from sqlmodel import Session
@@ -10,7 +10,7 @@ from .artifact_manager import DXMTArtifactManager
 from .errors import APIError
 from .models.api import (
     Architecture, BuildDetail, BuildDetailQuery, BuildListQuery, BuildPage,
-    BuildSource, BuildSummary, EmptyQuery, ErrorResponse, HealthResponse,
+    BuildSource, BuildSummary, EmptyQuery, ErrorResponse, FileName, HealthResponse, LatestBuildQuery,
 )
 
 router = APIRouter()
@@ -38,13 +38,30 @@ def require_build(manager: DXMTArtifactManager, source: BuildSource, ref: str):
     return build
 
 
+def require_latest_build(manager: DXMTArtifactManager, source: BuildSource, filters: LatestBuildQuery):
+    build = manager.get_latest_build(source, filters)
+    if build is None:
+        raise APIError(404, "build_not_found", f"No mirrored {source.value} build matches the requested files")
+    return build
+
+
 @build_router.get("", response_model=BuildPage, summary="List mirrored builds")
-def list_builds(filters: Annotated[BuildListQuery, Query()], manager: Manager) -> BuildPage:
+def list_builds(request: Request, filters: Annotated[BuildListQuery, Query()], manager: Manager) -> BuildPage:
     builds, total = manager.list_builds(filters)
     return BuildPage(
-        items=[BuildSummary.from_build(build) for build in builds], page=filters.page,
+        items=[BuildSummary.from_build(build, lambda route, **params: str(request.url_for(route, **params))) for build in builds], page=filters.page,
         per_page=filters.per_page, total=total, has_more=filters.page*filters.per_page < total,
     )
+
+
+@build_router.get("/{source}/latest", response_model=BuildDetail, summary="Find the newest build with matching files")
+def latest_build(
+    request: Request, response: Response, source: BuildSource,
+    filters: Annotated[LatestBuildQuery, Query()], manager: Manager,
+) -> BuildDetail:
+    build = require_latest_build(manager, source, filters)
+    response.headers["Cache-Control"] = "no-store"
+    return BuildDetail.from_build(build, lambda route, **params: str(request.url_for(route, **params)), filters.arch)
 
 
 @build_router.get(
@@ -54,10 +71,13 @@ def list_builds(filters: Annotated[BuildListQuery, Query()], manager: Manager) -
 )
 def download_file(
     source: BuildSource, ref: Annotated[str, Path(min_length=1)], arch: Architecture,
-    name: Annotated[str, Path(min_length=1, max_length=255, pattern=r"^[^/\\\x00]+$")],
+    name: FileName,
     query: Annotated[EmptyQuery, Query()], manager: Manager,
 ) -> RedirectResponse:
-    build = require_build(manager, source, ref)
+    build = (
+        require_latest_build(manager, source, LatestBuildQuery(arch=arch, file=name))
+        if ref == "latest" else require_build(manager, source, ref)
+    )
     artifact = manager.get_file(build, arch, name)
     if artifact is None:
         raise APIError(404, "file_not_found", f"No {arch.value} file named {name} in {source.value} build {ref}")
@@ -66,7 +86,9 @@ def download_file(
 
 @build_router.get("/{source}/{ref:path}", response_model=BuildDetail, name="get_build", summary="Inspect a mirrored build")
 def get_build(
-    source: BuildSource, ref: Annotated[str, Path(min_length=1)],
+    request: Request, source: BuildSource, ref: Annotated[str, Path(min_length=1)],
     filters: Annotated[BuildDetailQuery, Query()], manager: Manager,
 ) -> BuildDetail:
-    return BuildDetail.from_build(require_build(manager, source, ref), filters.arch)
+    return BuildDetail.from_build(
+        require_build(manager, source, ref), lambda route, **params: str(request.url_for(route, **params)), filters.arch,
+    )
